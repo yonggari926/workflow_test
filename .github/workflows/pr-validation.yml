@@ -11,6 +11,9 @@ jobs:
   validate-pr:
     name: Validate PR policy
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -23,6 +26,8 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           shopt -s nocasematch
           mapfile -t changed_files < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
@@ -40,6 +45,47 @@ jobs:
               echo "### Warning: web.config changed"
               printf -- '- `%s`\n' "${web_configs[@]}"
             } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          marker='<!-- web-config-warning -->'
+          comments_endpoint="repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+
+          if ! existing_comment_id="$(
+            gh api "$comments_endpoint?per_page=100" \
+              --jq 'map(select(.user.login == "github-actions[bot]" and (.body | contains("<!-- web-config-warning -->")))) | first | .id // empty'
+          )"; then
+            echo "::warning title=PR comment failed::Could not read existing PR comments."
+            exit 0
+          fi
+
+          if (( ${#web_configs[@]} > 0 )); then
+            body_file="$(mktemp)"
+            payload_file="$(mktemp)"
+            {
+              echo "$marker"
+              echo "## ⚠️ web.config 변경 감지"
+              echo
+              echo "다음 설정 파일이 변경되었습니다."
+              echo
+              printf -- '- `%s`\n' "${web_configs[@]}"
+              echo
+              echo "환경별 설정값, 연결 문자열 및 비밀정보 포함 여부를 확인해주세요."
+            } > "$body_file"
+            jq -Rs '{body: .}' "$body_file" > "$payload_file"
+
+            if [[ -n "$existing_comment_id" ]]; then
+              if ! gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing_comment_id" --input "$payload_file" > /dev/null; then
+                echo "::warning title=PR comment failed::Could not update the web.config warning comment."
+              fi
+            else
+              if ! gh api --method POST "$comments_endpoint" --input "$payload_file" > /dev/null; then
+                echo "::warning title=PR comment failed::Could not create the web.config warning comment."
+              fi
+            fi
+          elif [[ -n "$existing_comment_id" ]]; then
+            if ! gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$existing_comment_id" > /dev/null; then
+              echo "::warning title=PR comment failed::Could not remove the outdated web.config warning comment."
+            fi
           fi
 
       - name: Validate branch direction
