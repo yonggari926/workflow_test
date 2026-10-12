@@ -1,0 +1,101 @@
+name: PR Validation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-pr:
+    name: Validate PR policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Warn when web.config is changed
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          shopt -s nocasematch
+          mapfile -t changed_files < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          web_configs=()
+
+          for file in "${changed_files[@]}"; do
+            if [[ "$file" =~ (^|/)web\.config$ ]]; then
+              web_configs+=("$file")
+              echo "::warning file=$file,title=web.config changed::Please review environment-specific settings and secrets in $file."
+            fi
+          done
+
+          if (( ${#web_configs[@]} > 0 )); then
+            {
+              echo "### Warning: web.config changed"
+              printf -- '- `%s`\n' "${web_configs[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Validate branch direction
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [[ "$BASE_REF" == "develop" && "$HEAD_REF" =~ ^feature/.+ ]] ||
+             [[ "$BASE_REF" == "main" && "$HEAD_REF" == "develop" ]] ||
+             [[ "$BASE_REF" == "main" && "$HEAD_REF" =~ ^hotfix/.+ ]]; then
+            echo "Allowed PR direction: $HEAD_REF -> $BASE_REF"
+            exit 0
+          fi
+
+          echo "::error title=Invalid PR direction::$HEAD_REF -> $BASE_REF is not allowed. Allowed: feature/* -> develop, develop -> main, hotfix/* -> main."
+          exit 1
+
+  build:
+    name: Build .NET Framework solution
+    needs: validate-pr
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v3
+        with:
+          nuget-version: latest
+
+      - name: Find solution
+        shell: pwsh
+        run: |
+          $solutions = @(
+            Get-ChildItem -Path $env:GITHUB_WORKSPACE -File |
+              Where-Object { $_.Extension -in '.sln', '.slnx' } |
+              Sort-Object @{ Expression = { if ($_.Extension -eq '.sln') { 0 } else { 1 } } }, Name
+          )
+
+          if ($solutions.Count -ne 1) {
+            throw "Expected exactly one solution (.sln or .slnx) in the repository root, but found $($solutions.Count)."
+          }
+
+          "SOLUTION_PATH=$($solutions[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Solution: $($solutions[0].FullName)"
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: nuget restore "$env:SOLUTION_PATH" -NonInteractive
+
+      - name: Build solution
+        shell: pwsh
+        run: msbuild "$env:SOLUTION_PATH" /m /t:Build /p:Configuration=Debug '/p:Platform=Any CPU' /verbosity:minimal
